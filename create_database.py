@@ -81,7 +81,9 @@ def find_duplicate_chunks(chunks: list[Document]) -> tuple[list[Document], list[
 def add_to_chroma(chunks: list[Document]):
     # Load the existing database.
     db = Chroma(
-        persist_directory=CHROMA_DB_PATH, embedding_function=get_embedding_function()
+        persist_directory=CHROMA_DB_PATH, 
+        embedding_function=get_embedding_function(),
+        collection_name="documents"
     )
 
     # Calculate Page IDs and content hashes.
