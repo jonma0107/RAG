@@ -3,3 +3,8 @@ env/
 chroma_db/
 venv/
 data/
+
+
+# Ignore Python bytecode
+*.pyc
+__pycache__/

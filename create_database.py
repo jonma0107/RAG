@@ -1,11 +1,15 @@
-from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 import os
 import shutil
+import argparse
+import hashlib
 from dotenv import load_dotenv
+
+from get_embedding_function import get_embedding_function
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -14,118 +18,177 @@ load_dotenv()
 # Para crear la base de datos de Chroma
 CHROMA_DB_PATH = "chroma_db"
 
-DATA_PATH = "data"
+DATA_PATH = "data/sena/"
+
+def main():
+
+    # Check if the database should be cleared (using the --clear flag).
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset", action="store_true", help="Reset the database.")
+    args = parser.parse_args()
+    if args.reset:
+        print("✨ Clearing Database")
+        clear_database()
+
+    # Create (or update) the data store.
+    documents = load_documents()
+    chunks = split_documents(documents)
+    add_to_chroma(chunks)
+
 
 def load_documents():
-    loader = DirectoryLoader("data", glob="*.pdf")
-    documents = loader.load()
-    return documents
+    document_loader = PyPDFDirectoryLoader(DATA_PATH)
+    return document_loader.load()
 
-# SEPARADOR DE TEXTO RECURSIVO POR CARACTERES   
-def split_text(documents: list[Document]):
+
+def split_documents(documents: list[Document]):
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,  # Chunks más pequeños = menos tokens
-        chunk_overlap=100,  # Menos overlap = menos redundancia
+        chunk_size=800,
+        chunk_overlap=80,
         length_function=len,
-        add_start_index=True,
+        is_separator_regex=False,
+    )
+    return text_splitter.split_documents(documents)
+
+
+def calculate_content_hash(text: str) -> str:
+    """Calcula un hash SHA-256 del contenido del texto."""
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def find_duplicate_chunks(chunks: list[Document]) -> tuple[list[Document], list[Document]]:
+    """
+    Encuentra y separa chunks duplicados basándose en contenido similar.
+    Retorna: (chunks_unicos, chunks_duplicados)
+    """
+    unique_chunks = []
+    duplicate_chunks = []
+    seen_hashes = set()
+    
+    for chunk in chunks:
+        content_hash = chunk.metadata["content_hash"]
+        
+        if content_hash in seen_hashes:
+            duplicate_chunks.append(chunk)
+            print(f"⚠️  Duplicado detectado: {chunk.metadata.get('source', 'unknown')} - {chunk.metadata.get('page', 'unknown')}")
+        else:
+            seen_hashes.add(content_hash)
+            unique_chunks.append(chunk)
+    
+    return unique_chunks, duplicate_chunks
+
+
+def add_to_chroma(chunks: list[Document]):
+    # Load the existing database.
+    db = Chroma(
+        persist_directory=CHROMA_DB_PATH, embedding_function=get_embedding_function()
     )
 
-    chunks = text_splitter.split_documents(documents)
-    print(f"Split {len(documents)} documents into {len(chunks)} chunks!!!")
+    # Calculate Page IDs and content hashes.
+    chunks_with_ids = calculate_chunk_ids(chunks)
+    
+    # Add content hash to metadata
+    for chunk in chunks_with_ids:
+        chunk.metadata["content_hash"] = calculate_content_hash(chunk.page_content)
 
-    document = chunks[10]
-    print(document.page_content)
-    print(document.metadata)
-    # print(document.metadata["source"])
+    # Detect and remove duplicates from new chunks
+    unique_chunks, duplicate_chunks = find_duplicate_chunks(chunks_with_ids)
+    
+    if duplicate_chunks:
+        print(f"🚫 Se encontraron {len(duplicate_chunks)} chunks duplicados que serán ignorados")
+        print(f"📝 Se procesarán {len(unique_chunks)} chunks únicos")
+
+    # Add or Update the documents.
+    existing_items = db.get(include=[])  # IDs are always included by default
+    existing_ids = set(existing_items["ids"]) if existing_items["ids"] else set()
+    existing_metadatas = existing_items["metadatas"] if existing_items["metadatas"] else []
+    
+    print(f"Number of existing documents in DB: {len(existing_ids)}")
+
+    # Create a mapping of existing IDs to their content hashes
+    existing_hash_map = {}
+    if existing_metadatas:  # Solo procesar si hay metadatos existentes
+        for i, metadata in enumerate(existing_metadatas):
+            if metadata and "id" in metadata and "content_hash" in metadata:
+                existing_hash_map[metadata["id"]] = metadata["content_hash"]
+
+    # Separate chunks into new, updated, and unchanged
+    new_chunks = []
+    updated_chunks = []
+    
+    for chunk in unique_chunks:  # Solo procesar chunks únicos
+        chunk_id = chunk.metadata["id"]
+        chunk_hash = chunk.metadata["content_hash"]
+        
+        if chunk_id not in existing_ids:
+            # New chunk
+            new_chunks.append(chunk)
+        elif chunk_id in existing_hash_map and existing_hash_map[chunk_id] != chunk_hash:
+            # Updated chunk (same ID, different content)
+            updated_chunks.append(chunk)
+        # If same ID and same hash, chunk is unchanged
+
+    # Process new chunks
+    if len(new_chunks):
+        print(f"👉 Adding new documents: {len(new_chunks)}")
+        new_chunk_ids = [chunk.metadata["id"] for chunk in new_chunks]
+        db.add_documents(new_chunks, ids=new_chunk_ids)
+        print("✅ New documents added successfully")
+
+    # Process updated chunks (delete old, add new)
+    if len(updated_chunks):
+        print(f"🔄 Updating modified documents: {len(updated_chunks)}")
+        updated_chunk_ids = [chunk.metadata["id"] for chunk in updated_chunks]
+        
+        # Delete old versions
+        db.delete(ids=updated_chunk_ids)
+        
+        # Add updated versions
+        db.add_documents(updated_chunks, ids=updated_chunk_ids)
+        print("✅ Modified documents updated successfully")
+
+    if not new_chunks and not updated_chunks:
+        print("✅ No changes detected - database is up to date")
+    else:
+        print(f"📊 Summary: {len(new_chunks)} new, {len(updated_chunks)} updated")
+
+
+def calculate_chunk_ids(chunks):
+
+    # This will create IDs like "data/monopoly.pdf:6:2"
+    # Page Source : Page Number : Chunk Index
+
+    last_page_id = None
+    current_chunk_index = 0
+     
+
+    # Podemos recorrer todos los fragmentos y mirar sus metadatos
+    for chunk in chunks:
+        source = chunk.metadata.get("source")
+        page = chunk.metadata.get("page")
+        current_page_id = f"{source}:{page}"
+
+        # If the page ID is the same as the last one, increment the index.
+        if current_page_id == last_page_id:
+            current_chunk_index += 1
+        else:
+            current_chunk_index = 0
+
+        # Calculate the chunk ID.
+        chunk_id = f"{current_page_id}:{current_chunk_index}"
+        last_page_id = current_page_id
+
+        # Add it to the page meta-data.
+        chunk.metadata["id"] = chunk_id
+
     return chunks
 
-# CONVERTIR LOS FRAGMENTOS DE LOS DOCUMENTOS CARGADOS EN UNA BASE DE DATOS CHROMA
 
-def create_database(chunks: list[Document]):
-    # Si la base de datos ya existe, la eliminamos
+def clear_database():
     if os.path.exists(CHROMA_DB_PATH):
         shutil.rmtree(CHROMA_DB_PATH)
-    # Creamos la base de datos
-    db = Chroma.from_documents(
-        chunks,
-        OpenAIEmbeddings(model="text-embedding-3-small"), # Usando el nuevo modelo
-        persist_directory=CHROMA_DB_PATH,
-        collection_name="documents",
-    )
-    # Verificar que se guardaron los documentos
-    print("Base de datos creada correctamente")
-    print(f"Saved {len(chunks)} chunks in the database {CHROMA_DB_PATH}")
-    print(f"Database collection count: {db._collection.count()}")
-    
-    # Forzar persistencia explícita si el método existe
-    try:
-        db.persist()
-        print("Database persisted explicitly")
-    except AttributeError:
-        print("persist() method not available - using automatic persistence")
-
-
-# Cargar la base de datos de Chroma
-def load_database():
-    db = Chroma(
-        persist_directory=CHROMA_DB_PATH, 
-        embedding_function=OpenAIEmbeddings(model="text-embedding-3-small"),
-        collection_name="documents"  # Especificar el mismo nombre de colección
-    )
-    return db
 
 
 if __name__ == "__main__":
-    print("Loading documents...")
-    documents = load_documents()
-    print(f"Loaded {len(documents)} documents")
-    
-    print("Splitting documents...")
-    chunks = split_text(documents)
-    print("Document processing completed!")
-    
-    print("Creating database...")
-    create_database(chunks)
-    print("Database created successfully")
-
-    # Consultar la base de datos de Chroma
-    print("Loading database...")
-    print(f"Database directory exists: {os.path.exists(CHROMA_DB_PATH)}")
-    if os.path.exists(CHROMA_DB_PATH):
-        print(f"Database directory contents: {os.listdir(CHROMA_DB_PATH)}")
-    
-    db = load_database()
-    print(f"Database loaded. Collection count: {db._collection.count()}")
-    
-    query_text = "CUALES SON LOS DEBERES DEL APRENDIZ?"
-    print(f"Searching for: '{query_text}'")
-    results = db.similarity_search_with_score(query_text, k=5)
-    
-    # Si no hay resultados, probar con una consulta más simple
-    if len(results) == 0:
-        print("No results found. Trying simpler query...")
-        simple_query = "aprendiz"
-        results = db.similarity_search_with_score(simple_query, k=5)
-        print(f"Simple query results: {len(results)}")
-    
-    # Verificaciones antes de procesar los resultados
-    print(f"Raw results count: {len(results)}")
-    if len(results) > 0:
-        print(f"Best score: {results[0][1]:.3f}")
-        print(f"All scores: {[score for _, score in results]}")
-    
-    if len(results) == 0 or results[0][1] < 0.5:  # Umbral más realista
-        print(f"Unable to find matching results.")
-        print("Debug: Showing top results anyway:")
-        for i, (document, score) in enumerate(results[:3]):  # Mostrar top 3
-            print(f"Result {i+1} - Score: {score:.3f}")
-            print(f"Content: {document.page_content[:500]}...")  # Mostrar 500 caracteres
-            print(f"Source: {document.metadata.get('source', 'Unknown')}")
-            print("-" * 50)
-    else:
-        print(f"Found {len(results)} results with scores:")
-        for i, (document, score) in enumerate(results):
-            print(f"Result {i+1} - Score: {score:.3f}")
-            print(f"Content: {document.page_content[:200]}...")
-            print(f"Source: {document.metadata.get('source', 'Unknown')}")
-            print("-" * 50)
+    # Ejecutar la función principal
+    main()
